@@ -1,0 +1,184 @@
+MCAR_INLA_ST <- function(carto=NULL, data=NULL, covariate=NULL, ID.area=NULL, ID.year=NULL, ID.disease=NULL,
+                         O=NULL, E=NULL, W=NULL, spatial="intrinsic", temporal="rw1",
+                         interaction="TypeI", strategy="simplified.laplace"){
+
+  ##### Step:1 Pre-processing data #####
+  
+  ## Transform 'SpatialPolygonsDataFrame' object to 'sf' class
+  carto <- sf::st_as_sf(carto)
+  carto <- carto[order(sf::st_set_geometry(carto, NULL)[,ID.area]),]
+  data <- merge(data,carto[,c(ID.area)])
+  data$geometry <- NULL
+  data[,ID.year] <- paste(sprintf("%02d", as.numeric(as.character(data[,ID.year]))))
+  data[,ID.disease] <- paste(sprintf("%02d", as.numeric(as.character(data[,ID.disease]))))
+  data <- data[order(data[,ID.disease],data[,ID.year],data[,ID.area]),]
+  
+  ## Define spatial adjacency/structure matrix ##
+  if(is.null(W)){
+    carto.nb <- poly2nb(carto)
+    Ws <- as(nb2mat(carto.nb, style = "B", zero.policy= TRUE), "Matrix")
+  }else{
+    carto.nb <- mat2listw(W, style="B")$neighbours
+    Ws <- W
+  }
+  
+  S <- length(carto.nb)
+  Rs <- inla.as.sparse(Diagonal(S,colSums(Ws))-Ws)
+  Rs.Leroux <- inla.as.sparse(Diagonal(S)-Rs)
+  
+  ## Define temporal adjacency/structure matrix ##
+  T <- length(unique(data[,ID.year]))
+  if(temporal=="rw1") dif <- 1
+  if(temporal=="rw2") dif <- 2
+  D <- diff(diag(T), differences=dif)
+  Rt <- inla.as.sparse(t(D)%*%D)
+  
+  Wt <- -Rt
+  diag(Wt) <- 0
+  Wt <- drop0(Wt)
+  
+  ## Define hyperprior distributions ##
+  sdunif="expression:
+          logdens=-log_precision/2;
+          return(logdens)"
+  
+  lunif = "expression:
+          a = 1;
+          b = 1;
+          beta = exp(theta)/(1+exp(theta));
+          logdens = lgamma(a+b)-lgamma(a)-lgamma(b)+(a-1)*log(beta)+(b-1)*log(1-beta);
+          log_jacobian = log(beta*(1-beta));
+          return(logdens+log_jacobian)"
+  
+  ## Identifiability constraints for the interaction term ##
+  constraints <- function(Rs, Rt) {
+    
+    S <- nrow(Rs)
+    T <- nrow(Rt)
+    
+    if(interaction=="none"){
+      R <- NULL
+      r.def <- NULL
+      A.constr.st <- NULL
+    }
+    if(interaction=="TypeI"){
+      R <- Diagonal(S*T)
+      r.def <- 0
+      if(temporal=="rw1") A.constr.st <- matrix(1,1,S*T)
+      if(temporal=="rw2") A.constr.st <- matrix(rep(1:S,each=T),1,S*T)
+    }
+    if(interaction=="TypeII"){
+      R <- kronecker(Rt,Diagonal(S))
+      if(temporal=="rw1") r.def <- S
+      if(temporal=="rw2") r.def <- 2*S
+      A.constr.st <- kronecker(matrix(1,1,T),Diagonal(S))
+      A.constr.st <- as(A.constr.st[-1,],"matrix")
+    }
+    if(interaction=="TypeIII"){
+      R <- kronecker(Diagonal(T),Rs)
+      r.def <- T
+      A.constr.st <- kronecker(Diagonal(T),matrix(1,1,S))
+      A.constr.st <- as(A.constr.st[-1,],"matrix")
+    }
+    if(interaction=="TypeIV"){
+      R <- kronecker(Rt,Rs)
+      if(temporal=="rw1") r.def <- S+T-1
+      if(temporal=="rw2") r.def <- 2*S+T-2
+      A1 <- kronecker(matrix(1,1,T),Diagonal(S))
+      A2 <- kronecker(Diagonal(T),matrix(1,1,S))
+      A.constr.st <- as(rbind(A1[-1,],A2[-1,]),"matrix")
+    }
+    
+    return(list(R=R,r.def=r.def,A.constr.st=A.constr.st))
+  }
+  
+  
+  # Formula for INLA model ##
+  J <- length(unique(data[,ID.disease]))
+  M <- ncol(covariate)
+  
+  form <- "O ~ -1+"
+  form <- paste(form, paste(paste0("I",1:J),collapse="+"),sep="")
+  form <- paste(form, "+ f(idx, model=Mmodel.s, constr=FALSE, extraconstr=list(A=A.constr.s, e=rep(0,J)))")
+  form <- paste(form, "+ f(idy, model=Mmodel.t, constr=FALSE, extraconstr=list(A=A.constr.t, e=rep(0,J)))")
+  if(interaction!="none"){
+    form <- paste(form, "+", paste(paste0("f(idxy.",1:J,", model='generic0', Cmatrix=R, rankdef=r.def, constr=FALSE, extraconstr=list(A=A.constr.st, e=rep(0,nrow(A.constr.st))), hyper=list(prec=list(prior=sdunif)))"), collapse=" + "), sep=" ")
+  }
+  if(!is.null(covariate)){
+    form <- paste(form, "+", paste(paste0("f(idm.",1:M,", X",1:M,", model='iid')"), collapse=" + "), sep=" ")
+  }
+  formula <- stats::as.formula(form)
+  
+  ##### Step:2 Fitting the model with INLA #####
+  
+  ## Identifiability constraints for each disease ##
+  A.constr.s <- kronecker(diag(J), matrix(1,1,S))
+  A.constr.t <- kronecker(diag(J), matrix(1,1,T))
+  constr <- constraints(Rs,Rt)
+  R <- constr$R
+  r.def <- constr$r.def
+  A.constr.st <- constr$A.constr.st
+  
+  ## Define data frame for INLA model ##
+  data.INLA <- data.frame(O=data[,O], E=data[,E], Area=data[,ID.area], Year=data[,ID.year], Disease=data[,ID.disease],
+                          ID.area=rep(1:S,T*J), ID.year=rep(rep(1:T,each=S),J), ID.disease=rep(1:J,each=S*T), ID.area.year=rep(1:J,each=S*T))
+  
+  intercepts <- dummy_cols(data.INLA$ID.disease)[,-1]
+  intercepts[intercepts==0] <- NA
+  colnames(intercepts) <- paste0("I",1:J)
+  data.INLA <- cbind(data.INLA, intercepts)
+  
+  data.INLA$idx <- (data.INLA$ID.disease-1)*S + data.INLA$ID.area
+  data.INLA$idy <- (data.INLA$ID.disease-1)*T +  data.INLA$ID.year
+  idxy.<- paste0("idxy.", 1:J)
+  for(j in 1:J){
+    data.INLA[data.INLA$ID.disease==j, idxy.[j]] <-  (data.INLA[data.INLA$ID.disease==j, "ID.year"]-1)*S + data.INLA[data.INLA$ID.disease==j, "ID.area"]
+  }
+  
+  if(!is.null(covariate)){
+    for(i in 1:length(covariate)){
+      colnames(covariate)[i] <- paste0("X",i)
+    }
+    data.INLA <- cbind(data.INLA, covariate)
+    
+    idm. <- paste0("idm.", 1:M)
+    for(m in 1:M){
+      data.INLA[idm.[m]] <- data.INLA["idx"]
+    }
+  }
+  
+  ## Initial values for spatial M-model ##
+  aux <- as.data.frame(data.INLA %>% group_by(ID.disease, ID.area) %>% summarise(SMR=sum(O)/sum(E)))
+  Sigma <- cov(matrix(aux$SMR,S,J,byrow=F))
+  N <- t(chol(Sigma))
+  initial.values.s <- as.vector(c(log(diag(N)), N[lower.tri(N,diag=FALSE)]))
+  
+  ## Initial values for temporal M-model ##
+  aux <- as.data.frame(data.INLA %>% group_by(ID.disease, ID.year) %>% summarise(SMR=sum(O)/sum(E)))
+  Sigma <- cov(matrix(aux$SMR,T,J,byrow=F))
+  N <- t(chol(Sigma))
+  initial.values.t <- as.vector(c(log(diag(N)), N[lower.tri(N,diag=FALSE)]))
+  
+  
+  ## Define selected M-model ##
+  if(spatial=="intrinsic"){
+    Mmodel.s <- inla.rgeneric.define(Mmodel_icar, debug=FALSE, J=J, W=Ws, initial.values=initial.values.s)
+  }
+  if(spatial=="Leroux"){
+    Mmodel.s <- inla.rgeneric.define(Mmodel_lcar, debug=FALSE, J=J, W=Ws, initial.values=initial.values.s, alpha.min=0, alpha.max=1)
+  }
+  if(spatial=="proper"){
+    Mmodel.s <- inla.rgeneric.define(Mmodel_pcar, debug=FALSE, J=J, W=Ws, initial.values=initial.values.s, alpha.min=0, alpha.max=1)
+  }
+  
+  Mmodel.t <- inla.rgeneric.define(Mmodel_icar, debug=FALSE, J=J, W=Wt, initial.values=initial.values.t)
+  
+  
+  ## Fit the INLA model  ##
+  Model <- inla(formula, family="poisson", data=data.INLA, E=E,
+                control.predictor=list(compute=TRUE),
+                control.compute=list(dic=TRUE, cpo=TRUE, waic=TRUE, config=TRUE, return.marginals.predictor=TRUE),
+                control.inla=list(strategy=strategy), verbose = TRUE)
+  
+  return(Model)
+}
